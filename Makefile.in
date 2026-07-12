@@ -2,13 +2,14 @@ include config.mk
 
 SECP = deps/secp256k1
 DEFS = -DENABLE_MODULE_SCHNORRSIG -DENABLE_MODULE_EXTRAKEYS \
-	-DUSE_TCL_STUBS $(EXTRA_DEFS)
+	-DENABLE_MODULE_ECDH -DUSE_TCL_STUBS $(EXTRA_DEFS)
 CFLAGS = -O2 -Wall
 CPPFLAGS = -I$(SECP)/include -Ivendor $(TCL_INCLUDE_SPEC) $(DEFS)
 
 VPATH = vendor:$(SECP)/src
 
-SRCS = tclnostr.c rand.c sha256.c bech32.c \
+SRCS = tclnostr.c rand.c nip44.c chacha20.c hmac_sha256.c base64.c \
+	sha256.c bech32.c \
 	secp256k1.c precomputed_ecmult.c precomputed_ecmult_gen.c
 OBJS = $(SRCS:%.c=build/s/%.o)
 POBJS = $(SRCS:%.c=build/p/%.o)

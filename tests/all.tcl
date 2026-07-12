@@ -255,4 +255,294 @@ test we-verify-naks {fresh nak event with tags} nak {
 	-t u=https://api.example/x -t method=GET 2> /dev/null]
 } 1
 
+# ------------------------------------------------------ NIP-44 vectors ----
+
+source [file join [file dirname [info script]] nip44-vectors.tcl]
+
+proc unhex {h} {
+    encoding convertfrom utf-8 [binary decode hex $h]
+}
+
+testConstraint sha256sum [expr {[auto_execok sha256sum] ne ""}]
+proc sha256bytes {bytes} {
+    set path [file join [tcltest::temporaryDirectory] nip44-long.bin]
+    set f [open $path wb]
+    puts -nonewline $f $bytes
+    close $f
+    set h [lindex [exec sha256sum $path] 0]
+    file delete $path
+    return $h
+}
+
+# Second key for two-party tests: BIP-340 vector secret key 5.
+set SEC2 0000000000000000000000000000000000000000000000000000000000000005
+set PK2 [nostr::pubkey -hex $SEC2]
+
+test nip44-vectors-convkey {official conversation-key vectors} {
+    set bad {}
+    foreach v $NIP44_CONVKEY_VALID {
+	lassign $v sec1 pub2 ck
+	if {[nostr::nip44 convkey -sec $sec1 -pub $pub2] ne $ck} {
+	    lappend bad $ck
+	}
+    }
+    set bad
+} {}
+
+test nip44-vectors-padded-len {payload length reflects calc_padded_len} {
+    set ck [lindex [lindex $NIP44_ENCDEC 0] 2]
+    set nonce [lindex [lindex $NIP44_ENCDEC 0] 3]
+    set bad {}
+    foreach v $NIP44_PADDED {
+	lassign $v len padded
+	if {$len > 65535} continue	;# beyond encryptable range (pure calc)
+	# base64 of version(1) + nonce(32) + lenprefix(2) + padded + mac(32)
+	set want [expr {(((1 + 32 + 2 + $padded + 32) + 2) / 3) * 4}]
+	set p [nostr::nip44 encrypt -convkey $ck -nonce $nonce \
+	    [string repeat a $len]]
+	if {[string length $p] != $want} {
+	    lappend bad "$len:[string length $p]:$want"
+	}
+    }
+    set bad
+} {}
+
+test nip44-vectors-encrypt-decrypt {official payload vectors} {
+    set bad {}
+    foreach v $NIP44_ENCDEC {
+	lassign $v sec1 sec2 ck nonce pthex payload
+	set pt [unhex $pthex]
+	if {[nostr::nip44 convkey -sec $sec1 \
+		-pub [nostr::pubkey -hex $sec2]] ne $ck} {
+	    lappend bad "ck:$nonce"
+	    continue
+	}
+	if {[nostr::nip44 encrypt -convkey $ck -nonce $nonce $pt] \
+		ne $payload} {
+	    lappend bad "enc:$nonce"
+	}
+	if {[nostr::nip44 decrypt -sec $sec2 \
+		-pub [nostr::pubkey -hex $sec1] $payload] ne $pt} {
+	    lappend bad "dec:$nonce"
+	}
+    }
+    set bad
+} {}
+
+test nip44-vectors-long-messages {long-message vectors, hashes only} sha256sum {
+    set bad {}
+    foreach v $NIP44_LONG {
+	lassign $v ck nonce pathex repeat ptsha paysha
+	set pt [string repeat [unhex $pathex] $repeat]
+	if {[sha256bytes [encoding convertto utf-8 $pt]] ne $ptsha} {
+	    lappend bad "pt:$nonce"
+	    continue
+	}
+	set p [nostr::nip44 encrypt -convkey $ck -nonce $nonce $pt]
+	if {[sha256bytes $p] ne $paysha} {
+	    lappend bad "pay:$nonce"
+	}
+	if {[nostr::nip44 decrypt -convkey $ck $p] ne $pt} {
+	    lappend bad "dec:$nonce"
+	}
+    }
+    set bad
+} {}
+
+test nip44-vectors-invalid-lengths {encrypt rejects out-of-range sizes} {
+    set ck [lindex [lindex $NIP44_ENCDEC 0] 2]
+    set bad {}
+    foreach len $NIP44_INVALID_LEN {
+	if {![catch {nostr::nip44 encrypt -convkey $ck \
+		[string repeat a $len]}]} {
+	    lappend bad $len
+	}
+    }
+    set bad
+} {}
+
+test nip44-vectors-invalid-convkey {bad keys are rejected} {
+    set bad {}
+    foreach v $NIP44_INVALID_CONVKEY {
+	lassign $v sec1 pub2 notehex
+	if {![catch {nostr::nip44 convkey -sec $sec1 -pub $pub2}]} {
+	    lappend bad [unhex $notehex]
+	}
+    }
+    set bad
+} {}
+
+test nip44-vectors-invalid-decrypt {bad payloads are rejected} {
+    set bad {}
+    foreach v $NIP44_INVALID_DECRYPT {
+	lassign $v ck payload notehex
+	if {![catch {nostr::nip44 decrypt -convkey $ck $payload}]} {
+	    lappend bad [unhex $notehex]
+	}
+    }
+    set bad
+} {}
+
+# -------------------------------------------------------- nip44 command ----
+
+test nip44-convkey-symmetric {ECDH is symmetric} {
+    expr {[nostr::nip44 convkey -sec $SEC -pub $PK2]
+	eq [nostr::nip44 convkey -sec $SEC2 -pub $PK]}
+} 1
+
+test nip44-roundtrip-unicode {} {
+    set pt "привет, nip44 🎁"
+    nostr::nip44 decrypt -sec $SEC2 -pub $PK \
+	[nostr::nip44 encrypt -sec $SEC -pub $PK2 $pt]
+} "привет, nip44 🎁"
+
+test nip44-convkey-equals-secpub {cached convkey is the same path} {
+    set ck [nostr::nip44 convkey -sec $SEC -pub $PK2]
+    set p [nostr::nip44 encrypt -convkey $ck "hello"]
+    nostr::nip44 decrypt -sec $SEC2 -pub $PK $p
+} hello
+
+test nip44-wrong-key-fails {} {
+    set p [nostr::nip44 encrypt -sec $SEC -pub $PK2 "hello"]
+    catch {nostr::nip44 decrypt -sec $SEC -pub $PK2 \
+	[string map {A B B A} $p]}
+} 1
+
+# --------------------------------------------------------- rumor, wrap ----
+
+test event-unsigned {id matches nostr::id, no sig member} {
+    set r [nostr::event -pubkey $PK -kind 14 -content "hi" \
+	-created-at 1700000000]
+    list [expr {[evfield $r id] eq [nostr::id -pubkey $PK -kind 14 \
+	-content "hi" -created-at 1700000000]}] [regexp {"sig"} $r] \
+	[expr {[nostr::sign -sec $SEC -json $r] ne ""}]
+} {1 0 1}
+
+test event-rejects-signed {} {
+    catch {nostr::event -json [nostr::sign -sec $SEC -kind 1]} msg
+    set msg
+} {event already has a sig: a rumor must be unsigned}
+
+test wrap-unwrap-roundtrip {} {
+    set rumor [nostr::event -pubkey $PK -kind 14 -content "секрет" \
+	-tags [list [list p $PK2]]]
+    set wrap [nostr::wrap -sec $SEC -to $PK2 $rumor]
+    set got [nostr::unwrap -sec $SEC2 $wrap]
+    list [expr {[dict get $got from] eq $PK}] \
+	[expr {[dict get $got rumor] eq $rumor}] \
+	[regexp {"kind":1059,} $wrap]
+} {1 1 1}
+
+test wrap-self-copy {sender's own wrapped copy} {
+    set rumor [nostr::event -pubkey $PK -kind 14 -content "self"]
+    expr {[dict get [nostr::unwrap -sec $SEC \
+	[nostr::wrap -sec $SEC -to $PK $rumor]] rumor] eq $rumor}
+} 1
+
+test wrap-backdated {NIP-59 timestamps land in the two-day window} {
+    set rumor [nostr::event -pubkey $PK -kind 14 -content "t"]
+    set wrap [nostr::wrap -sec $SEC -to $PK2 $rumor]
+    regexp {"created_at":(\d+)} $wrap -> ts
+    set now [clock seconds]
+    expr {$ts <= $now + 5 && $ts >= $now - 172811}
+} 1
+
+test wrap-rejects-signed-rumor {} {
+    catch {nostr::wrap -sec $SEC -to $PK2 [nostr::sign -sec $SEC -kind 14]} msg
+    set msg
+} {rumor must be unsigned (it has a sig)}
+
+test wrap-rejects-foreign-rumor {} {
+    set rumor [nostr::event -pubkey $PK2 -kind 14 -content "x"]
+    catch {nostr::wrap -sec $SEC -to $PK2 $rumor} msg
+    set msg
+} {rumor pubkey does not match the signing key}
+
+test unwrap-wrong-recipient {} {
+    set rumor [nostr::event -pubkey $PK -kind 14 -content "x"]
+    set wrap [nostr::wrap -sec $SEC -to $PK2 $rumor]
+    catch {nostr::unwrap -sec $SEC \
+	    0000000000000000000000000000000000000000000000000000000000000007 \
+	    $wrap}
+} 1
+
+test unwrap-tampered-wrap {} {
+    set rumor [nostr::event -pubkey $PK -kind 14 -content "x"]
+    set wrap [nostr::wrap -sec $SEC -to $PK2 $rumor]
+    catch {nostr::unwrap -sec $SEC2 \
+	[string map {{"kind":1059,} {"kind":1058,}} $wrap]} msg
+    set msg
+} {gift wrap does not verify}
+
+test unwrap-impersonation {seal author != rumor pubkey is rejected} {
+    # attacker (key 7) seals a rumor that claims to be from $PK
+    set attacker 0000000000000000000000000000000000000000000000000000000000000007
+    set rumor [nostr::event -pubkey $PK -kind 14 -content "fake"]
+    set seal [nostr::sign -sec $attacker -kind 13 \
+	-content [nostr::nip44 encrypt -sec $attacker -pub $PK2 $rumor]]
+    set eph [nostr::keygen]
+    set wrap [nostr::sign -sec $eph -kind 1059 -tags [list [list p $PK2]] \
+	-content [nostr::nip44 encrypt -sec $eph -pub $PK2 $seal]]
+    catch {nostr::unwrap -sec $SEC2 $wrap} msg
+    set msg
+} {rumor pubkey does not match the seal}
+
+test unwrap-signed-rumor-rejected {} {
+    set signed [nostr::sign -sec $SEC -kind 14 -content "signed!"]
+    set seal [nostr::sign -sec $SEC -kind 13 \
+	-content [nostr::nip44 encrypt -sec $SEC -pub $PK2 $signed]]
+    set eph [nostr::keygen]
+    set wrap [nostr::sign -sec $eph -kind 1059 -tags [list [list p $PK2]] \
+	-content [nostr::nip44 encrypt -sec $eph -pub $PK2 $seal]]
+    catch {nostr::unwrap -sec $SEC2 $wrap} msg
+    set msg
+} {rumor is signed (must be unsigned)}
+
+# -------------------------------------------------------- relay frames ----
+
+test frame-ok {} {
+    nostr::frame {["OK","abcd",true,"duplicate: already have it"]}
+} {OK abcd 1 {duplicate: already have it}}
+
+test frame-eose-notice {} {
+    list [nostr::frame {["EOSE","sub1"]}] \
+	[nostr::frame {["NOTICE","slow down"]}] \
+	[nostr::frame {["X",null,false,-3.5e2]}]
+} {{EOSE sub1} {NOTICE {slow down}} {X {} 0 -3.5e2}}
+
+test frame-event-raw-slice {sliced event JSON still verifies} {
+    set ev [nostr::sign -sec $SEC -kind 1 -content "via frame" \
+	-created-at 1700000000]
+    set f [nostr::frame "\[\"EVENT\",\"s1\",$ev\]"]
+    list [lindex $f 0] [lindex $f 1] [expr {[lindex $f 2] eq $ev}] \
+	[nostr::verify [lindex $f 2]]
+} {EVENT s1 1 1}
+
+test frame-nested-structures {brackets/braces inside strings don't confuse} {
+    nostr::frame {["REQ","s",{"a":["[","]"],"b":{"c":2}}]}
+} {REQ s {{"a":["[","]"],"b":{"c":2}}}}
+
+test frame-not-array {} {
+    catch {nostr::frame {{"kind":1}}} msg
+    set msg
+} {invalid frame JSON: a relay frame is a JSON array}
+
+test frame-trailing-data {} {
+    catch {nostr::frame {["EOSE","s"] x}} msg
+    set msg
+} {invalid frame JSON: trailing data after frame}
+
+# ------------------------------------------------ nak nip44 cross-check ----
+
+test nak-decrypts-ours {} nak {
+    exec $nak decrypt --sec $SEC2 -p $PK \
+	[nostr::nip44 encrypt -sec $SEC -pub $PK2 "спам и мясо ⚡"] \
+	2> /dev/null
+} "спам и мясо ⚡"
+
+test nak-we-decrypt {} nak {
+    set p [exec $nak encrypt --sec $SEC -p $PK2 "обратно ⚡" 2> /dev/null]
+    nostr::nip44 decrypt -sec $SEC2 -pub $PK $p
+} "обратно ⚡"
+
 cleanupTests

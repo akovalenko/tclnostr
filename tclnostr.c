@@ -29,8 +29,10 @@
 #include "sha256.h"
 #include "bech32.h"
 #include "rand.h"
+#include "base64.h"
+#include "nip44.h"
 
-#define NOSTR_VERSION "0.1"
+#define NOSTR_VERSION "0.2"
 
 typedef struct {
     secp256k1_context *ctx;	/* one per interp, randomized at creation */
@@ -272,6 +274,8 @@ ComputeEventId(Tcl_Interp *interp, NostrState *st, const char pkhex[65],
 
 /* ------------------------------------------------- event JSON emission -- */
 
+/* sighex == NULL emits an unsigned event (no sig member): a NIP-59
+ * rumor. */
 static int
 EmitEvent(Tcl_Interp *interp, NostrState *st, const char idhex[65],
     const char pkhex[65], uint64_t createdAt, int kind, Tcl_Obj *tags,
@@ -298,9 +302,12 @@ EmitEvent(Tcl_Interp *interp, NostrState *st, const char idhex[65],
     }
     Tcl_DStringAppend(&out, ",\"content\":", -1);
     AppendJsonStringObj(st, &out, content, 0);
-    Tcl_DStringAppend(&out, ",\"sig\":\"", -1);
-    Tcl_DStringAppend(&out, sighex, 128);
-    Tcl_DStringAppend(&out, "\"}", 2);
+    if (sighex != NULL) {
+	Tcl_DStringAppend(&out, ",\"sig\":\"", -1);
+	Tcl_DStringAppend(&out, sighex, 128);
+	Tcl_DStringAppend(&out, "\"", 1);
+    }
+    Tcl_DStringAppend(&out, "}", 1);
 
     Tcl_ExternalToUtfDString(st->utf8, Tcl_DStringValue(&out),
 	Tcl_DStringLength(&out), &utf);
@@ -320,6 +327,7 @@ EmitEvent(Tcl_Interp *interp, NostrState *st, const char idhex[65],
 typedef struct {
     Tcl_Interp *interp;
     NostrState *st;
+    const char *what;		/* "event" or "frame", for messages */
     const unsigned char *p, *end;
 } JsonParser;
 
@@ -348,7 +356,7 @@ static void
 JpError(JsonParser *jp, const char *msg)
 {
     Tcl_SetObjResult(jp->interp,
-	Tcl_ObjPrintf("invalid event JSON: %s", msg));
+	Tcl_ObjPrintf("invalid %s JSON: %s", jp->what, msg));
 }
 
 static void
@@ -645,6 +653,7 @@ ParseEvent(Tcl_Interp *interp, NostrState *st, Tcl_Obj *jsonObj,
     Tcl_UtfToExternalDString(st->utf8, src, len, &ext);
     jp->interp = interp;
     jp->st = st;
+    jp->what = "event";
     jp->p = (const unsigned char *)Tcl_DStringValue(&ext);
     jp->end = jp->p + Tcl_DStringLength(&ext);
 
@@ -1045,13 +1054,52 @@ out:
     return rc;
 }
 
+/* Structural checks + id recompute + BIP-340 verification of a parsed
+ * event.  TCL_ERROR for structural problems (message set); TCL_OK with
+ * *okOut = the crypto verdict otherwise. */
+static int
+VerifyParsed(Tcl_Interp *interp, NostrState *st, ParsedEvent *ev, int *okOut)
+{
+    unsigned char id32[32], want32[32], sig64[64], pk32[32];
+    int ok = 0;
+
+    if (ev->id == NULL || ev->pubkey == NULL || ev->sig == NULL
+	    || ev->content == NULL || ev->tags == NULL
+	    || !ev->hasKind || !ev->hasCreated) {
+	Tcl_SetObjResult(interp, Tcl_NewStringObj(
+	    "incomplete event: id, pubkey, created_at, kind, tags, "
+	    "content and sig are all required", -1));
+	return TCL_ERROR;
+    }
+    if (!IsLowerHexObj(ev->id, 64) || !IsLowerHexObj(ev->pubkey, 64)
+	    || !IsLowerHexObj(ev->sig, 128)) {
+	Tcl_SetObjResult(interp, Tcl_NewStringObj(
+	    "id, pubkey and sig must be lowercase hex of 64/64/128 digits",
+	    -1));
+	return TCL_ERROR;
+    }
+    HexDecode(Tcl_GetString(ev->id), 64, id32, 1);
+    HexDecode(Tcl_GetString(ev->pubkey), 64, pk32, 1);
+    HexDecode(Tcl_GetString(ev->sig), 128, sig64, 1);
+    if (ComputeEventId(interp, st, Tcl_GetString(ev->pubkey), ev->created_at,
+	    ev->kind, ev->tags, ev->content, want32) != TCL_OK) {
+	return TCL_ERROR;
+    }
+    if (memcmp(id32, want32, 32) == 0) {
+	secp256k1_xonly_pubkey xpk;
+	ok = secp256k1_xonly_pubkey_parse(st->ctx, &xpk, pk32)
+	    && secp256k1_schnorrsig_verify(st->ctx, sig64, id32, 32, &xpk);
+    }
+    *okOut = ok;
+    return TCL_OK;
+}
+
 static int
 VerifyObjCmd(void *cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[])
 {
     NostrState *st = (NostrState *)cd;
     ParsedEvent ev;
-    unsigned char id32[32], want32[32], sig64[64], pk32[32];
-    int ok = 0;
+    int ok;
 
     if (objc != 2) {
 	Tcl_WrongNumArgs(interp, 1, objv, "eventJson");
@@ -1060,35 +1108,9 @@ VerifyObjCmd(void *cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[])
     if (ParseEvent(interp, st, objv[1], &ev) != TCL_OK) {
 	return TCL_ERROR;
     }
-    if (ev.id == NULL || ev.pubkey == NULL || ev.sig == NULL
-	    || ev.content == NULL || ev.tags == NULL
-	    || !ev.hasKind || !ev.hasCreated) {
-	Tcl_SetObjResult(interp, Tcl_NewStringObj(
-	    "incomplete event: id, pubkey, created_at, kind, tags, "
-	    "content and sig are all required", -1));
+    if (VerifyParsed(interp, st, &ev, &ok) != TCL_OK) {
 	FreeParsedEvent(&ev);
 	return TCL_ERROR;
-    }
-    if (!IsLowerHexObj(ev.id, 64) || !IsLowerHexObj(ev.pubkey, 64)
-	    || !IsLowerHexObj(ev.sig, 128)) {
-	Tcl_SetObjResult(interp, Tcl_NewStringObj(
-	    "id, pubkey and sig must be lowercase hex of 64/64/128 digits",
-	    -1));
-	FreeParsedEvent(&ev);
-	return TCL_ERROR;
-    }
-    HexDecode(Tcl_GetString(ev.id), 64, id32, 1);
-    HexDecode(Tcl_GetString(ev.pubkey), 64, pk32, 1);
-    HexDecode(Tcl_GetString(ev.sig), 128, sig64, 1);
-    if (ComputeEventId(interp, st, Tcl_GetString(ev.pubkey), ev.created_at,
-	    ev.kind, ev.tags, ev.content, want32) != TCL_OK) {
-	FreeParsedEvent(&ev);
-	return TCL_ERROR;
-    }
-    if (memcmp(id32, want32, 32) == 0) {
-	secp256k1_xonly_pubkey xpk;
-	ok = secp256k1_xonly_pubkey_parse(st->ctx, &xpk, pk32)
-	    && secp256k1_schnorrsig_verify(st->ctx, sig64, id32, 32, &xpk);
     }
     FreeParsedEvent(&ev);
     Tcl_SetObjResult(interp, Tcl_NewBooleanObj(ok));
@@ -1227,6 +1249,859 @@ DecodeObjCmd(void *cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[])
     return TCL_OK;
 }
 
+/* ------------------------------------------- NIP-44, NIP-59 gift wrap -- */
+
+/* Validate strict UTF-8 (structure, overlongs, surrogates, range; all
+ * byte values below 0x80 pass) and convert to a Tcl string object. */
+static int
+BytesToStringObj(Tcl_Interp *interp, NostrState *st,
+    const unsigned char *p, size_t n, const char *what, Tcl_Obj **out)
+{
+    size_t i = 0;
+    Tcl_DString utf;
+
+    while (i < n) {
+	unsigned char c = p[i];
+	unsigned int cp;
+	int nb, k;
+
+	if (c < 0x80) {
+	    i++;
+	    continue;
+	}
+	nb = (c >= 0xF0) ? 4 : (c >= 0xE0) ? 3 : (c >= 0xC0) ? 2 : 0;
+	if (nb == 0 || c > 0xF4 || n - i < (size_t)nb) goto bad;
+	cp = c & (unsigned char)(0xFF >> (nb + 1));
+	for (k = 1; k < nb; k++) {
+	    if ((p[i+k] & 0xC0) != 0x80) goto bad;
+	    cp = (cp << 6) | (p[i+k] & 0x3F);
+	}
+	if ((nb == 2 && cp < 0x80) || (nb == 3 && cp < 0x800)
+		|| (nb == 4 && (cp < 0x10000 || cp > 0x10FFFF))
+		|| (cp >= 0xD800 && cp <= 0xDFFF)) goto bad;
+	i += nb;
+    }
+    Tcl_ExternalToUtfDString(st->utf8, (const char *)p, (Tcl_Size)n, &utf);
+    *out = Tcl_NewStringObj(Tcl_DStringValue(&utf), Tcl_DStringLength(&utf));
+    Tcl_DStringFree(&utf);
+    return TCL_OK;
+bad:
+    Tcl_SetObjResult(interp, Tcl_ObjPrintf("%s is not valid UTF-8", what));
+    return TCL_ERROR;
+}
+
+/* NIP-59: seal and gift-wrap timestamps SHOULD be randomized up to two
+ * days in the past so the wraps don't leak message timing. */
+static uint64_t
+BackdatedNow(void)
+{
+    unsigned char r[8];
+    uint64_t v = 0;
+    int i;
+
+    if (nostr_fill_random(r, 8)) {
+	for (i = 0; i < 8; i++) {
+	    v = (v << 8) | r[i];
+	}
+    }
+    return (uint64_t)time(NULL) - v % 172801;
+}
+
+/* Conversation key from -sec/-pub (either side works: ECDH is
+ * symmetric) or straight from a cached -convkey. */
+static int
+GetConvKey(Tcl_Interp *interp, NostrState *st, Tcl_Obj *secObj,
+    Tcl_Obj *pubObj, Tcl_Obj *ckObj, unsigned char convkey[32])
+{
+    unsigned char sec32[32], pub32[32];
+    char pkhex[65];
+    const char *err;
+
+    if (ckObj != NULL) {
+	Tcl_Size len;
+	const char *s;
+
+	if (secObj != NULL || pubObj != NULL) {
+	    Tcl_SetObjResult(interp, Tcl_NewStringObj(
+		"-convkey cannot be combined with -sec/-pub", -1));
+	    return TCL_ERROR;
+	}
+	s = Tcl_GetStringFromObj(ckObj, &len);
+	if (len != 64 || !HexDecode(s, 64, convkey, 0)) {
+	    Tcl_SetObjResult(interp, Tcl_NewStringObj(
+		"-convkey must be 64 hex digits", -1));
+	    return TCL_ERROR;
+	}
+	return TCL_OK;
+    }
+    if (secObj == NULL || pubObj == NULL) {
+	Tcl_SetObjResult(interp, Tcl_NewStringObj(
+	    "need -sec and -pub (or -convkey)", -1));
+	return TCL_ERROR;
+    }
+    if (GetSecKey(interp, secObj, sec32) != TCL_OK) {
+	return TCL_ERROR;
+    }
+    if (GetPubkeyHex(interp, pubObj, pkhex) != TCL_OK) {
+	memset(sec32, 0, sizeof(sec32));
+	return TCL_ERROR;
+    }
+    HexDecode(pkhex, 64, pub32, 1);
+    err = nostr_nip44_convkey(st->ctx, sec32, pub32, convkey);
+    memset(sec32, 0, sizeof(sec32));
+    if (err != NULL) {
+	Tcl_SetObjResult(interp, Tcl_NewStringObj(err, -1));
+	return TCL_ERROR;
+    }
+    return TCL_OK;
+}
+
+/* Encrypt bytes under convkey into a fresh payload string obj; a NULL
+ * nonce32 draws a fresh random one (the option exists for the vector
+ * tests). */
+static int
+Nip44EncryptObj(Tcl_Interp *interp, const unsigned char convkey[32],
+    const unsigned char *nonce32, const unsigned char *bytes, size_t len,
+    Tcl_Obj **out)
+{
+    unsigned char nonce[32];
+    char *payload;
+    const char *err;
+
+    if (len < NOSTR_NIP44_MIN_PLAIN || len > NOSTR_NIP44_MAX_PLAIN) {
+	Tcl_SetObjResult(interp, Tcl_NewStringObj(
+	    "plaintext must be 1 to 65535 bytes", -1));
+	return TCL_ERROR;
+    }
+    if (nonce32 == NULL) {
+	if (!nostr_fill_random(nonce, 32)) {
+	    Tcl_SetObjResult(interp,
+		Tcl_NewStringObj("no entropy source", -1));
+	    return TCL_ERROR;
+	}
+	nonce32 = nonce;
+    }
+    payload = (char *)ckalloc(nostr_nip44_payload_len(len) + 1);
+    err = nostr_nip44_encrypt(convkey, nonce32, bytes, len, payload);
+    if (err != NULL) {
+	ckfree(payload);
+	Tcl_SetObjResult(interp, Tcl_NewStringObj(err, -1));
+	return TCL_ERROR;
+    }
+    *out = Tcl_NewStringObj(payload, -1);
+    ckfree(payload);
+    return TCL_OK;
+}
+
+/* Decrypt a payload obj under convkey, appending the plaintext bytes
+ * to out (caller inits and frees).  errPrefix names the layer. */
+static int
+Nip44DecryptObj(Tcl_Interp *interp, NostrState *st,
+    const unsigned char convkey[32], Tcl_Obj *payloadObj,
+    const char *errPrefix, Tcl_DString *out)
+{
+    Tcl_DString pext;
+    unsigned char *plain;
+    size_t n, plainlen = 0;
+    const char *err, *s;
+    Tcl_Size slen;
+
+    s = Tcl_GetStringFromObj(payloadObj, &slen);
+    Tcl_UtfToExternalDString(st->utf8, s, slen, &pext);
+    n = (size_t)Tcl_DStringLength(&pext);
+    plain = (unsigned char *)ckalloc(n > 0 ? n : 1);
+    err = nostr_nip44_decrypt(convkey, Tcl_DStringValue(&pext), n, plain,
+	&plainlen);
+    Tcl_DStringFree(&pext);
+    if (err != NULL) {
+	ckfree(plain);
+	Tcl_SetObjResult(interp, Tcl_ObjPrintf("%s: %s", errPrefix, err));
+	return TCL_ERROR;
+    }
+    Tcl_DStringAppend(out, (const char *)plain, (Tcl_Size)plainlen);
+    memset(plain, 0, plainlen);
+    ckfree(plain);
+    return TCL_OK;
+}
+
+static int
+Nip44ObjCmd(void *cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[])
+{
+    NostrState *st = (NostrState *)cd;
+    Tcl_Obj *secObj = NULL, *pubObj = NULL, *ckObj = NULL, *nonceObj = NULL;
+    unsigned char convkey[32], nonce[32];
+    const unsigned char *noncePtr = NULL;
+    const char *sub = NULL;
+    int i, end, isEnc = 0, isDec = 0, isCk = 0, rc = TCL_ERROR;
+
+    if (objc >= 2) {
+	sub = Tcl_GetString(objv[1]);
+	isEnc = strcmp(sub, "encrypt") == 0;
+	isDec = strcmp(sub, "decrypt") == 0;
+	isCk = strcmp(sub, "convkey") == 0;
+    }
+    if (objc < 2 || (!isEnc && !isDec && !isCk)) {
+	Tcl_SetObjResult(interp, Tcl_NewStringObj(
+	    "bad subcommand: must be convkey, encrypt or decrypt", -1));
+	return TCL_ERROR;
+    }
+    end = isCk ? objc : objc - 1;
+    if (end < 4 || ((end - 2) % 2) != 0) {
+	Tcl_WrongNumArgs(interp, 2, objv, isCk ? "-sec key -pub key"
+	    : "?-sec key -pub key? ?-convkey key? ?-nonce hex? data");
+	return TCL_ERROR;
+    }
+    for (i = 2; i < end; i += 2) {
+	const char *opt = Tcl_GetString(objv[i]);
+	if (strcmp(opt, "-sec") == 0) secObj = objv[i+1];
+	else if (strcmp(opt, "-pub") == 0) pubObj = objv[i+1];
+	else if (strcmp(opt, "-convkey") == 0) ckObj = objv[i+1];
+	else if (strcmp(opt, "-nonce") == 0 && isEnc) nonceObj = objv[i+1];
+	else {
+	    Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+		"bad option \"%s\": must be -sec, -pub%s or -convkey", opt,
+		isEnc ? ", -nonce" : ""));
+	    return TCL_ERROR;
+	}
+    }
+    if (GetConvKey(interp, st, secObj, pubObj, ckObj, convkey) != TCL_OK) {
+	return TCL_ERROR;
+    }
+    if (isCk) {
+	char hex[65];
+
+	HexEncode(convkey, 32, hex);
+	Tcl_SetObjResult(interp, Tcl_NewStringObj(hex, 64));
+	rc = TCL_OK;
+    } else if (isEnc) {
+	Tcl_DString ext;
+	Tcl_Obj *out;
+	const char *s;
+	Tcl_Size slen;
+
+	if (nonceObj != NULL) {
+	    s = Tcl_GetStringFromObj(nonceObj, &slen);
+	    if (slen != 64 || !HexDecode(s, 64, nonce, 0)) {
+		Tcl_SetObjResult(interp, Tcl_NewStringObj(
+		    "-nonce must be 64 hex digits", -1));
+		goto out;
+	    }
+	    noncePtr = nonce;
+	}
+	s = Tcl_GetStringFromObj(objv[objc-1], &slen);
+	Tcl_UtfToExternalDString(st->utf8, s, slen, &ext);
+	rc = Nip44EncryptObj(interp, convkey, noncePtr,
+	    (const unsigned char *)Tcl_DStringValue(&ext),
+	    (size_t)Tcl_DStringLength(&ext), &out);
+	Tcl_DStringFree(&ext);
+	if (rc == TCL_OK) {
+	    Tcl_SetObjResult(interp, out);
+	}
+    } else {
+	Tcl_DString plain;
+	Tcl_Obj *out;
+
+	Tcl_DStringInit(&plain);
+	rc = Nip44DecryptObj(interp, st, convkey, objv[objc-1], "nip44",
+	    &plain);
+	if (rc == TCL_OK) {
+	    rc = BytesToStringObj(interp, st,
+		(const unsigned char *)Tcl_DStringValue(&plain),
+		(size_t)Tcl_DStringLength(&plain), "plaintext", &out);
+	    if (rc == TCL_OK) {
+		Tcl_SetObjResult(interp, out);
+	    }
+	}
+	memset(Tcl_DStringValue(&plain), 0, Tcl_DStringLength(&plain));
+	Tcl_DStringFree(&plain);
+    }
+out:
+    memset(convkey, 0, sizeof(convkey));
+    return rc;
+}
+
+/* nostr::event — build an *unsigned* event (a NIP-59 rumor): id is
+ * computed, the sig member is absent. */
+static int
+EventObjCmd(void *cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[])
+{
+    NostrState *st = (NostrState *)cd;
+    Tcl_Obj *pubObj = NULL, *jsonObj = NULL, *kindObj = NULL;
+    Tcl_Obj *contentObj = NULL, *tagsObj = NULL, *createdObj = NULL;
+    Tcl_Obj *tags, *content, *res;
+    ParsedEvent ev;
+    int i, haveEv, kind, rc = TCL_ERROR;
+    uint64_t created;
+    unsigned char id32[32];
+    char pkhex[65], idhex[65];
+
+    if (objc < 3 || (objc % 2) != 1) {
+	Tcl_WrongNumArgs(interp, 1, objv, "?-pubkey key? ?-json event? "
+	    "?-kind n? ?-content text? ?-tags list? ?-created-at time?");
+	return TCL_ERROR;
+    }
+    for (i = 1; i + 1 < objc; i += 2) {
+	const char *opt = Tcl_GetString(objv[i]);
+	if (strcmp(opt, "-pubkey") == 0) pubObj = objv[i+1];
+	else if (strcmp(opt, "-json") == 0) jsonObj = objv[i+1];
+	else if (strcmp(opt, "-kind") == 0) kindObj = objv[i+1];
+	else if (strcmp(opt, "-content") == 0) contentObj = objv[i+1];
+	else if (strcmp(opt, "-tags") == 0) tagsObj = objv[i+1];
+	else if (strcmp(opt, "-created-at") == 0) createdObj = objv[i+1];
+	else {
+	    Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+		"bad option \"%s\": must be -pubkey, -json, -kind, "
+		"-content, -tags or -created-at", opt));
+	    return TCL_ERROR;
+	}
+    }
+    if (CollectEventArgs(interp, st, jsonObj, kindObj, contentObj, tagsObj,
+	    createdObj, &ev, &haveEv, &created, &kind, &tags,
+	    &content) != TCL_OK) {
+	return TCL_ERROR;
+    }
+    if (haveEv && ev.sig != NULL) {
+	Tcl_SetObjResult(interp, Tcl_NewStringObj(
+	    "event already has a sig: a rumor must be unsigned", -1));
+	goto out;
+    }
+    if (pubObj != NULL) {
+	if (GetPubkeyHex(interp, pubObj, pkhex) != TCL_OK) {
+	    goto out;
+	}
+	if (haveEv && ev.pubkey != NULL
+		&& strcmp(Tcl_GetString(ev.pubkey), pkhex) != 0) {
+	    Tcl_SetObjResult(interp, Tcl_NewStringObj(
+		"event pubkey does not match -pubkey", -1));
+	    goto out;
+	}
+    } else if (haveEv && ev.pubkey != NULL) {
+	if (!IsLowerHexObj(ev.pubkey, 64)) {
+	    Tcl_SetObjResult(interp, Tcl_NewStringObj(
+		"invalid pubkey in event", -1));
+	    goto out;
+	}
+	memcpy(pkhex, Tcl_GetString(ev.pubkey), 64);
+	pkhex[64] = '\0';
+    } else {
+	Tcl_SetObjResult(interp, Tcl_NewStringObj(
+	    "no public key: pass -pubkey or an event with one", -1));
+	goto out;
+    }
+    if (ComputeEventId(interp, st, pkhex, created, kind, tags, content,
+	    id32) != TCL_OK) {
+	goto out;
+    }
+    HexEncode(id32, 32, idhex);
+    if (EmitEvent(interp, st, idhex, pkhex, created, kind, tags, content,
+	    NULL, &res) != TCL_OK) {
+	goto out;
+    }
+    Tcl_SetObjResult(interp, res);
+    rc = TCL_OK;
+out:
+    Tcl_DecrRefCount(tags);
+    Tcl_DecrRefCount(content);
+    if (haveEv) FreeParsedEvent(&ev);
+    return rc;
+}
+
+/* nostr::wrap — NIP-59 gift wrap of an unsigned rumor: seal (kind 13,
+ * signed by the sender) inside a wrap (kind 1059, signed by a one-shot
+ * ephemeral key), both timestamps backdated. */
+static int
+WrapObjCmd(void *cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[])
+{
+    NostrState *st = (NostrState *)cd;
+    Tcl_Obj *secObj = NULL, *toObj = NULL;
+    ParsedEvent ev;
+    secp256k1_keypair kp;
+    secp256k1_xonly_pubkey xpk;
+    Tcl_DString ext;
+    Tcl_Obj *rumorObj = NULL, *payloadObj = NULL, *tagsObj = NULL,
+	*sealObj = NULL, *wrapTagsObj = NULL, *res = NULL;
+    unsigned char sec32[32], eph32[32], to32[32], pk32[32], convkey[32];
+    unsigned char id32[32];
+    char pkhex[65], tohex[65], idhex[65];
+    const char *err;
+    const char *s;
+    Tcl_Size slen;
+    int i, haveEv = 0, extInit = 0, rc = TCL_ERROR;
+
+    memset(eph32, 0, sizeof(eph32));
+    if (objc != 6) {
+	Tcl_WrongNumArgs(interp, 1, objv, "-sec key -to pubkey rumorJson");
+	return TCL_ERROR;
+    }
+    for (i = 1; i + 1 < objc - 1; i += 2) {
+	const char *opt = Tcl_GetString(objv[i]);
+	if (strcmp(opt, "-sec") == 0) secObj = objv[i+1];
+	else if (strcmp(opt, "-to") == 0) toObj = objv[i+1];
+	else {
+	    Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+		"bad option \"%s\": must be -sec or -to", opt));
+	    return TCL_ERROR;
+	}
+    }
+    if (secObj == NULL || toObj == NULL) {
+	Tcl_SetObjResult(interp,
+	    Tcl_NewStringObj("-sec and -to are required", -1));
+	return TCL_ERROR;
+    }
+    if (GetSecKey(interp, secObj, sec32) != TCL_OK) {
+	return TCL_ERROR;
+    }
+    if (GetPubkeyHex(interp, toObj, tohex) != TCL_OK) {
+	goto out;
+    }
+    HexDecode(tohex, 64, to32, 1);
+    if (!secp256k1_keypair_create(st->ctx, &kp, sec32)) {
+	Tcl_SetObjResult(interp, Tcl_NewStringObj("invalid secret key", -1));
+	goto out;
+    }
+    secp256k1_keypair_xonly_pub(st->ctx, &xpk, NULL, &kp);
+    memset(&kp, 0, sizeof(kp));
+    secp256k1_xonly_pubkey_serialize(st->ctx, pk32, &xpk);
+    HexEncode(pk32, 32, pkhex);
+
+    if (ParseEvent(interp, st, objv[objc-1], &ev) != TCL_OK) {
+	goto out;
+    }
+    haveEv = 1;
+    if (ev.sig != NULL) {
+	Tcl_SetObjResult(interp, Tcl_NewStringObj(
+	    "rumor must be unsigned (it has a sig)", -1));
+	goto out;
+    }
+    if (ev.pubkey == NULL || !IsLowerHexObj(ev.pubkey, 64)
+	    || ev.id == NULL || !IsLowerHexObj(ev.id, 64)
+	    || !ev.hasKind || !ev.hasCreated || ev.tags == NULL
+	    || ev.content == NULL) {
+	Tcl_SetObjResult(interp, Tcl_NewStringObj(
+	    "incomplete rumor: id, pubkey, created_at, kind, tags and "
+	    "content are required", -1));
+	goto out;
+    }
+    if (strcmp(Tcl_GetString(ev.pubkey), pkhex) != 0) {
+	Tcl_SetObjResult(interp, Tcl_NewStringObj(
+	    "rumor pubkey does not match the signing key", -1));
+	goto out;
+    }
+    if (ComputeEventId(interp, st, pkhex, ev.created_at, ev.kind, ev.tags,
+	    ev.content, id32) != TCL_OK) {
+	goto out;
+    }
+    HexEncode(id32, 32, idhex);
+    if (strcmp(Tcl_GetString(ev.id), idhex) != 0) {
+	Tcl_SetObjResult(interp,
+	    Tcl_NewStringObj("rumor id mismatch", -1));
+	goto out;
+    }
+    if (EmitEvent(interp, st, idhex, pkhex, ev.created_at, ev.kind, ev.tags,
+	    ev.content, NULL, &rumorObj) != TCL_OK) {
+	rumorObj = NULL;
+	goto out;
+    }
+    Tcl_IncrRefCount(rumorObj);
+
+    /* seal: canonical rumor nip44-encrypted sender -> recipient */
+    err = nostr_nip44_convkey(st->ctx, sec32, to32, convkey);
+    if (err != NULL) {
+	Tcl_SetObjResult(interp, Tcl_NewStringObj(err, -1));
+	goto out;
+    }
+    s = Tcl_GetStringFromObj(rumorObj, &slen);
+    Tcl_UtfToExternalDString(st->utf8, s, slen, &ext);
+    extInit = 1;
+    if (Nip44EncryptObj(interp, convkey, NULL,
+	    (const unsigned char *)Tcl_DStringValue(&ext),
+	    (size_t)Tcl_DStringLength(&ext), &payloadObj) != TCL_OK) {
+	payloadObj = NULL;
+	goto out;
+    }
+    Tcl_IncrRefCount(payloadObj);
+    Tcl_DStringFree(&ext);
+    extInit = 0;
+    tagsObj = Tcl_NewListObj(0, NULL);
+    Tcl_IncrRefCount(tagsObj);
+    if (SignEvent(interp, st, sec32, BackdatedNow(), 13, tagsObj, payloadObj,
+	    NULL, &sealObj) != TCL_OK) {
+	sealObj = NULL;
+	goto out;
+    }
+    Tcl_IncrRefCount(sealObj);
+
+    /* wrap: seal nip44-encrypted ephemeral -> recipient */
+    do {
+	if (!nostr_fill_random(eph32, 32)) {
+	    Tcl_SetObjResult(interp,
+		Tcl_NewStringObj("no entropy source", -1));
+	    goto out;
+	}
+    } while (!secp256k1_keypair_create(st->ctx, &kp, eph32));
+    memset(&kp, 0, sizeof(kp));
+    err = nostr_nip44_convkey(st->ctx, eph32, to32, convkey);
+    if (err != NULL) {
+	Tcl_SetObjResult(interp, Tcl_NewStringObj(err, -1));
+	goto out;
+    }
+    Tcl_DecrRefCount(payloadObj);
+    payloadObj = NULL;
+    s = Tcl_GetStringFromObj(sealObj, &slen);
+    Tcl_UtfToExternalDString(st->utf8, s, slen, &ext);
+    extInit = 1;
+    if (Nip44EncryptObj(interp, convkey, NULL,
+	    (const unsigned char *)Tcl_DStringValue(&ext),
+	    (size_t)Tcl_DStringLength(&ext), &payloadObj) != TCL_OK) {
+	payloadObj = NULL;
+	goto out;
+    }
+    Tcl_IncrRefCount(payloadObj);
+    Tcl_DStringFree(&ext);
+    extInit = 0;
+    {
+	Tcl_Obj *ptag = Tcl_NewListObj(0, NULL);
+
+	Tcl_ListObjAppendElement(NULL, ptag, Tcl_NewStringObj("p", 1));
+	Tcl_ListObjAppendElement(NULL, ptag, Tcl_NewStringObj(tohex, 64));
+	wrapTagsObj = Tcl_NewListObj(1, &ptag);
+	Tcl_IncrRefCount(wrapTagsObj);
+    }
+    if (SignEvent(interp, st, eph32, BackdatedNow(), 1059, wrapTagsObj,
+	    payloadObj, NULL, &res) != TCL_OK) {
+	goto out;
+    }
+    Tcl_SetObjResult(interp, res);
+    rc = TCL_OK;
+out:
+    memset(sec32, 0, sizeof(sec32));
+    memset(eph32, 0, sizeof(eph32));
+    memset(convkey, 0, sizeof(convkey));
+    if (extInit) Tcl_DStringFree(&ext);
+    if (rumorObj) Tcl_DecrRefCount(rumorObj);
+    if (payloadObj) Tcl_DecrRefCount(payloadObj);
+    if (tagsObj) Tcl_DecrRefCount(tagsObj);
+    if (sealObj) Tcl_DecrRefCount(sealObj);
+    if (wrapTagsObj) Tcl_DecrRefCount(wrapTagsObj);
+    if (haveEv) FreeParsedEvent(&ev);
+    return rc;
+}
+
+/* nostr::unwrap — open a received gift wrap, verifying the chain: wrap
+ * signature, seal signature, and rumor pubkey == seal pubkey (the
+ * check that stops impersonation inside a valid wrap). */
+static int
+UnwrapObjCmd(void *cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[])
+{
+    NostrState *st = (NostrState *)cd;
+    ParsedEvent wrapEv, sealEv, rumEv;
+    Tcl_Obj *sealObj = NULL, *rumorObj = NULL, *dict;
+    Tcl_DString plain;
+    unsigned char sec32[32], pk32[32], convkey[32], id32[32];
+    char idhex[65];
+    const char *err;
+    int ok, haveWrap = 0, haveSeal = 0, haveRum = 0, rc = TCL_ERROR;
+
+    if (objc != 4 || strcmp(Tcl_GetString(objv[1]), "-sec") != 0) {
+	Tcl_WrongNumArgs(interp, 1, objv, "-sec key wrapJson");
+	return TCL_ERROR;
+    }
+    Tcl_DStringInit(&plain);
+    if (GetSecKey(interp, objv[2], sec32) != TCL_OK) {
+	return TCL_ERROR;
+    }
+    if (ParseEvent(interp, st, objv[3], &wrapEv) != TCL_OK) {
+	goto out;
+    }
+    haveWrap = 1;
+    if (VerifyParsed(interp, st, &wrapEv, &ok) != TCL_OK) {
+	goto out;
+    }
+    if (!ok) {
+	Tcl_SetObjResult(interp,
+	    Tcl_NewStringObj("gift wrap does not verify", -1));
+	goto out;
+    }
+    if (wrapEv.kind != 1059) {
+	Tcl_SetObjResult(interp,
+	    Tcl_NewStringObj("not a gift wrap (kind 1059)", -1));
+	goto out;
+    }
+    HexDecode(Tcl_GetString(wrapEv.pubkey), 64, pk32, 1);
+    err = nostr_nip44_convkey(st->ctx, sec32, pk32, convkey);
+    if (err != NULL) {
+	Tcl_SetObjResult(interp, Tcl_ObjPrintf("gift wrap: %s", err));
+	goto out;
+    }
+    if (Nip44DecryptObj(interp, st, convkey, wrapEv.content, "gift wrap",
+	    &plain) != TCL_OK) {
+	goto out;
+    }
+    if (BytesToStringObj(interp, st,
+	    (const unsigned char *)Tcl_DStringValue(&plain),
+	    (size_t)Tcl_DStringLength(&plain), "decrypted seal",
+	    &sealObj) != TCL_OK) {
+	sealObj = NULL;
+	goto out;
+    }
+    Tcl_IncrRefCount(sealObj);
+    Tcl_DStringSetLength(&plain, 0);
+
+    if (ParseEvent(interp, st, sealObj, &sealEv) != TCL_OK) {
+	goto out;
+    }
+    haveSeal = 1;
+    if (VerifyParsed(interp, st, &sealEv, &ok) != TCL_OK) {
+	goto out;
+    }
+    if (!ok) {
+	Tcl_SetObjResult(interp,
+	    Tcl_NewStringObj("seal does not verify", -1));
+	goto out;
+    }
+    if (sealEv.kind != 13) {
+	Tcl_SetObjResult(interp,
+	    Tcl_NewStringObj("sealed event is not a seal (kind 13)", -1));
+	goto out;
+    }
+    HexDecode(Tcl_GetString(sealEv.pubkey), 64, pk32, 1);
+    err = nostr_nip44_convkey(st->ctx, sec32, pk32, convkey);
+    if (err != NULL) {
+	Tcl_SetObjResult(interp, Tcl_ObjPrintf("seal: %s", err));
+	goto out;
+    }
+    if (Nip44DecryptObj(interp, st, convkey, sealEv.content, "seal",
+	    &plain) != TCL_OK) {
+	goto out;
+    }
+    if (BytesToStringObj(interp, st,
+	    (const unsigned char *)Tcl_DStringValue(&plain),
+	    (size_t)Tcl_DStringLength(&plain), "decrypted rumor",
+	    &rumorObj) != TCL_OK) {
+	rumorObj = NULL;
+	goto out;
+    }
+    Tcl_IncrRefCount(rumorObj);
+
+    if (ParseEvent(interp, st, rumorObj, &rumEv) != TCL_OK) {
+	goto out;
+    }
+    haveRum = 1;
+    if (rumEv.sig != NULL) {
+	Tcl_SetObjResult(interp,
+	    Tcl_NewStringObj("rumor is signed (must be unsigned)", -1));
+	goto out;
+    }
+    if (rumEv.pubkey == NULL || !IsLowerHexObj(rumEv.pubkey, 64)
+	    || rumEv.id == NULL || !IsLowerHexObj(rumEv.id, 64)
+	    || !rumEv.hasKind || !rumEv.hasCreated || rumEv.tags == NULL
+	    || rumEv.content == NULL) {
+	Tcl_SetObjResult(interp, Tcl_NewStringObj(
+	    "incomplete rumor: id, pubkey, created_at, kind, tags and "
+	    "content are required", -1));
+	goto out;
+    }
+    if (strcmp(Tcl_GetString(rumEv.pubkey),
+	    Tcl_GetString(sealEv.pubkey)) != 0) {
+	Tcl_SetObjResult(interp, Tcl_NewStringObj(
+	    "rumor pubkey does not match the seal", -1));
+	goto out;
+    }
+    if (ComputeEventId(interp, st, Tcl_GetString(rumEv.pubkey),
+	    rumEv.created_at, rumEv.kind, rumEv.tags, rumEv.content,
+	    id32) != TCL_OK) {
+	goto out;
+    }
+    HexEncode(id32, 32, idhex);
+    if (strcmp(Tcl_GetString(rumEv.id), idhex) != 0) {
+	Tcl_SetObjResult(interp, Tcl_NewStringObj("rumor id mismatch", -1));
+	goto out;
+    }
+
+    dict = Tcl_NewDictObj();
+    Tcl_DictObjPut(NULL, dict, Tcl_NewStringObj("from", -1), sealEv.pubkey);
+    Tcl_DictObjPut(NULL, dict, Tcl_NewStringObj("rumor", -1), rumorObj);
+    Tcl_SetObjResult(interp, dict);
+    rc = TCL_OK;
+out:
+    memset(sec32, 0, sizeof(sec32));
+    memset(convkey, 0, sizeof(convkey));
+    memset(Tcl_DStringValue(&plain), 0, Tcl_DStringLength(&plain));
+    Tcl_DStringFree(&plain);
+    if (sealObj) Tcl_DecrRefCount(sealObj);
+    if (rumorObj) Tcl_DecrRefCount(rumorObj);
+    if (haveWrap) FreeParsedEvent(&wrapEv);
+    if (haveSeal) FreeParsedEvent(&sealEv);
+    if (haveRum) FreeParsedEvent(&rumEv);
+    return rc;
+}
+
+/* ----------------------------------------------------- relay frames -- */
+
+/* Skip a JSON object/array checking only bracket balance and string
+ * boundaries; full validation of a sliced event happens later, in
+ * ParseEvent/verify.  jp->p starts at '{' or '['. */
+static int
+JpSkipStruct(JsonParser *jp)
+{
+    int depth = 0;
+
+    while (jp->p < jp->end) {
+	unsigned char c = *jp->p;
+
+	if (c == '"') {
+	    jp->p++;
+	    while (jp->p < jp->end && *jp->p != '"') {
+		if (*jp->p == '\\') {
+		    jp->p++;
+		    if (jp->p >= jp->end) break;
+		}
+		jp->p++;
+	    }
+	    if (jp->p >= jp->end) {
+		JpError(jp, "unterminated string");
+		return 0;
+	    }
+	    jp->p++;
+	    continue;
+	}
+	if (c == '{' || c == '[') {
+	    depth++;
+	} else if (c == '}' || c == ']') {
+	    depth--;
+	    if (depth == 0) {
+		jp->p++;
+		return 1;
+	    }
+	    if (depth < 0) {
+		JpError(jp, "unbalanced brackets");
+		return 0;
+	    }
+	}
+	jp->p++;
+    }
+    JpError(jp, "unbalanced brackets");
+    return 0;
+}
+
+/* nostr::frame — split one relay message (a JSON array) into a Tcl
+ * list: strings are decoded, true/false/null become 1/0/{}, numbers
+ * come through as their literal text, and objects/arrays are handed
+ * back as raw JSON slices — so an EVENT frame yields the exact bytes
+ * to feed nostr::verify / nostr::unwrap. */
+static int
+FrameObjCmd(void *cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[])
+{
+    NostrState *st = (NostrState *)cd;
+    Tcl_DString ext;
+    JsonParser jpBuf, *jp = &jpBuf;
+    Tcl_Obj *list = NULL;
+    const char *src;
+    Tcl_Size srclen;
+    int rc = TCL_ERROR;
+
+    if (objc != 2) {
+	Tcl_WrongNumArgs(interp, 1, objv, "frameJson");
+	return TCL_ERROR;
+    }
+    src = Tcl_GetStringFromObj(objv[1], &srclen);
+    Tcl_UtfToExternalDString(st->utf8, src, srclen, &ext);
+    jp->interp = interp;
+    jp->st = st;
+    jp->what = "frame";
+    jp->p = (const unsigned char *)Tcl_DStringValue(&ext);
+    jp->end = jp->p + Tcl_DStringLength(&ext);
+
+    JpSkipWs(jp);
+    if (jp->p >= jp->end || *jp->p != '[') {
+	JpError(jp, "a relay frame is a JSON array");
+	goto out;
+    }
+    jp->p++;
+    list = Tcl_NewListObj(0, NULL);
+    Tcl_IncrRefCount(list);
+    JpSkipWs(jp);
+    if (jp->p < jp->end && *jp->p == ']') {
+	jp->p++;
+	goto tail;
+    }
+    for (;;) {
+	Tcl_Obj *el;
+	unsigned char c;
+
+	JpSkipWs(jp);
+	if (jp->p >= jp->end) {
+	    JpError(jp, "expected value");
+	    goto out;
+	}
+	c = *jp->p;
+	if (c == '"') {
+	    el = JpParseString(jp);
+	    if (el == NULL) goto out;
+	} else if (c == '{' || c == '[') {
+	    const unsigned char *start = jp->p;
+	    Tcl_DString utf;
+
+	    if (!JpSkipStruct(jp)) goto out;
+	    Tcl_ExternalToUtfDString(st->utf8, (const char *)start,
+		(Tcl_Size)(jp->p - start), &utf);
+	    el = Tcl_NewStringObj(Tcl_DStringValue(&utf),
+		Tcl_DStringLength(&utf));
+	    Tcl_DStringFree(&utf);
+	} else if (c == 't' && jp->end - jp->p >= 4
+		&& memcmp(jp->p, "true", 4) == 0) {
+	    jp->p += 4;
+	    el = Tcl_NewBooleanObj(1);
+	} else if (c == 'f' && jp->end - jp->p >= 5
+		&& memcmp(jp->p, "false", 5) == 0) {
+	    jp->p += 5;
+	    el = Tcl_NewBooleanObj(0);
+	} else if (c == 'n' && jp->end - jp->p >= 4
+		&& memcmp(jp->p, "null", 4) == 0) {
+	    jp->p += 4;
+	    el = Tcl_NewObj();
+	} else if (c == '-' || (c >= '0' && c <= '9')) {
+	    const unsigned char *start = jp->p;
+
+	    jp->p++;
+	    while (jp->p < jp->end && ((*jp->p >= '0' && *jp->p <= '9')
+		    || *jp->p == '.' || *jp->p == 'e' || *jp->p == 'E'
+		    || *jp->p == '+' || *jp->p == '-')) {
+		jp->p++;
+	    }
+	    el = Tcl_NewStringObj((const char *)start,
+		(Tcl_Size)(jp->p - start));
+	} else {
+	    JpError(jp, "unexpected token");
+	    goto out;
+	}
+	Tcl_ListObjAppendElement(NULL, list, el);
+	JpSkipWs(jp);
+	if (jp->p < jp->end && *jp->p == ',') {
+	    jp->p++;
+	    continue;
+	}
+	if (jp->p < jp->end && *jp->p == ']') {
+	    jp->p++;
+	    break;
+	}
+	JpError(jp, "expected , or ]");
+	goto out;
+    }
+tail:
+    JpSkipWs(jp);
+    if (jp->p != jp->end) {
+	JpError(jp, "trailing data after frame");
+	goto out;
+    }
+    Tcl_SetObjResult(interp, list);
+    rc = TCL_OK;
+out:
+    if (list) Tcl_DecrRefCount(list);
+    Tcl_DStringFree(&ext);
+    return rc;
+}
+
 /* ----------------------------------------------------------------- init -- */
 
 static void
@@ -1276,6 +2151,11 @@ Nostr_Init(Tcl_Interp *interp)
     Tcl_CreateObjCommand(interp, "::nostr::pubkey", PubkeyObjCmd, st, NULL);
     Tcl_CreateObjCommand(interp, "::nostr::encode", EncodeObjCmd, st, NULL);
     Tcl_CreateObjCommand(interp, "::nostr::decode", DecodeObjCmd, st, NULL);
+    Tcl_CreateObjCommand(interp, "::nostr::nip44", Nip44ObjCmd, st, NULL);
+    Tcl_CreateObjCommand(interp, "::nostr::event", EventObjCmd, st, NULL);
+    Tcl_CreateObjCommand(interp, "::nostr::wrap", WrapObjCmd, st, NULL);
+    Tcl_CreateObjCommand(interp, "::nostr::unwrap", UnwrapObjCmd, st, NULL);
+    Tcl_CreateObjCommand(interp, "::nostr::frame", FrameObjCmd, st, NULL);
 
     return Tcl_PkgProvide(interp, "nostr", NOSTR_VERSION);
 }
