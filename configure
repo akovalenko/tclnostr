@@ -18,6 +18,16 @@ for arg in "$@"; do
     esac
 done
 
+# An empty submodule fails loudly here; otherwise the compiler falls
+# through -Ideps/secp256k1/include to the system headers, which may be
+# a libsecp256k1 too old for secp256k1_schnorrsig_sign32, and the
+# shared-lib link would not even notice the missing symbol.
+if [ ! -f "$(dirname "$0")/deps/secp256k1/include/secp256k1.h" ]; then
+    echo "configure: deps/secp256k1 is empty (libsecp256k1 submodule);" >&2
+    echo "           run: git submodule update --init" >&2
+    exit 1
+fi
+
 if [ -z "$TCLDIR" ]; then
     for sh in tclsh9.0 tclsh8.6 tclsh; do
 	guess=$(echo 'puts [::tcl::pkgconfig get libdir,install]' \

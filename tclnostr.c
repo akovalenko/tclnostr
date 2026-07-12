@@ -807,7 +807,10 @@ SignEvent(Tcl_Interp *interp, NostrState *st, const unsigned char sec32[32],
 	Tcl_SetObjResult(interp, Tcl_NewStringObj("invalid secret key", -1));
 	return TCL_ERROR;
     }
-    secp256k1_keypair_xonly_pub(st->ctx, &xpk, NULL, &kp);
+    if (!secp256k1_keypair_xonly_pub(st->ctx, &xpk, NULL, &kp)) {
+	Tcl_SetObjResult(interp, Tcl_NewStringObj("pubkey derivation failed", -1));
+	goto out;
+    }
     secp256k1_xonly_pubkey_serialize(st->ctx, pk32, &xpk);
     HexEncode(pk32, 32, pkhex);
     if (expectPkHex != NULL && strcmp(expectPkHex, pkhex) != 0) {
@@ -1177,7 +1180,11 @@ PubkeyObjCmd(void *cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[])
 	return TCL_ERROR;
     }
     memset(sec32, 0, sizeof(sec32));
-    secp256k1_keypair_xonly_pub(st->ctx, &xpk, NULL, &kp);
+    if (!secp256k1_keypair_xonly_pub(st->ctx, &xpk, NULL, &kp)) {
+	memset(&kp, 0, sizeof(kp));
+	Tcl_SetObjResult(interp, Tcl_NewStringObj("pubkey derivation failed", -1));
+	return TCL_ERROR;
+    }
     memset(&kp, 0, sizeof(kp));
     secp256k1_xonly_pubkey_serialize(st->ctx, pk32, &xpk);
     if (asHex) {
@@ -1663,7 +1670,11 @@ WrapObjCmd(void *cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[])
 	Tcl_SetObjResult(interp, Tcl_NewStringObj("invalid secret key", -1));
 	goto out;
     }
-    secp256k1_keypair_xonly_pub(st->ctx, &xpk, NULL, &kp);
+    if (!secp256k1_keypair_xonly_pub(st->ctx, &xpk, NULL, &kp)) {
+	memset(&kp, 0, sizeof(kp));
+	Tcl_SetObjResult(interp, Tcl_NewStringObj("pubkey derivation failed", -1));
+	goto out;
+    }
     memset(&kp, 0, sizeof(kp));
     secp256k1_xonly_pubkey_serialize(st->ctx, pk32, &xpk);
     HexEncode(pk32, 32, pkhex);
