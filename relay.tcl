@@ -271,8 +271,15 @@ proc nostr::relay::ParseIdField {ev} {
 #   filterDict is a Tcl dict rendered to a JSON filter object (values
 #   that are lists become JSON arrays; #-prefixed keys and scalar
 #   kinds/limit/since/until are handled).  Sends ["REQ",subid,filter].
+#   subid is held to [A-Za-z0-9_-]{1,64}: NIP-01 merely wants a
+#   nonempty string of at most 64 chars, but Send's framer sniffs a
+#   leading '{' to tell already-JSON elements from plain strings, so a
+#   freeform subid could be spliced into the frame as raw JSON.
 proc nostr::relay::subscribe {tok subid filter} {
     upvar #0 $tok C
+    if {![regexp {^[A-Za-z0-9_-]{1,64}$} $subid]} {
+	return -code error "bad subscription id \"$subid\""
+    }
     set C(events) {}
     set C(eose) 0
     set C(evseq) 0

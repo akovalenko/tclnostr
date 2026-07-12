@@ -44,6 +44,13 @@ check "returned event verifies" [nostr::verify [lindex $back 0]] 1
 check "returned event has the same id" \
     [regexp -inline {"id":"([0-9a-f]{64})"} [lindex $back 0]] \
     [list "\"id\":\"$noteid\"" $noteid]
+# subids are confined to a safe charset: Send's framer sniffs a
+# leading '{' for already-JSON elements, so a freeform subid could be
+# spliced into the frame as raw JSON.
+check "subscribe rejects a frame-injecting subid" \
+    [catch {nostr::relay::subscribe $c "{\"evil\":1}," {}}] 1
+check "subscribe rejects an empty subid" \
+    [catch {nostr::relay::subscribe $c "" {}}] 1
 nostr::relay::close $c
 
 # 2. NIP-17 DM: alice -> bob, bob fetches and unwraps.
