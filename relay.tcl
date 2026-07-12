@@ -347,11 +347,19 @@ proc nostr::dm::send {args} {
 	$wrapTo] id] results $results]
 }
 
+# NIP-59: seal/wrap created_at is randomized up to two days into the
+# past, so a `since` filter must reach back at least that far or it
+# hides the very wraps it means to catch.
+variable nostr::dm::backdate 172800
+
 # nostr::dm::fetch -sec K -relays {url ...} ?-since T? ?-limit N?
 #   Subscribe for gift wraps addressed to us, unwrap each, and return a
 #   list of dicts {from <hex> rumor <json>}.  Wraps that fail to unwrap
-#   (not for us, tampered) are skipped.
+#   (not for us, tampered) are skipped.  -since is the wall-clock moment
+#   you care about; it is widened by the NIP-59 backdate window before
+#   it hits the relay, so backdated wraps are not missed.
 proc nostr::dm::fetch {args} {
+    variable backdate
     set sec ""; set relays {}; set since ""; set limit ""
     foreach {k v} $args {
 	switch -- $k {
@@ -367,7 +375,10 @@ proc nostr::dm::fetch {args} {
     }
     set mypub [nostr::pubkey -hex $sec]
     set filter [dict create kinds 1059 #p [list $mypub]]
-    if {$since ne ""} { dict set filter since $since }
+    if {$since ne ""} {
+	set s [expr {$since - $backdate}]
+	dict set filter since [expr {$s < 0 ? 0 : $s}]
+    }
     if {$limit ne ""} { dict set filter limit $limit }
     set msgs {}
     set seen {}

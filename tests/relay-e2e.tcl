@@ -54,6 +54,12 @@ check "dm published to relay" \
 
 set got [nostr::dm::fetch -sec $BOB -relays [list $URL]]
 check "bob receives exactly one dm" [llength $got] 1
+
+# a tight -since must still find the wrap: NIP-59 backdates the wrap up
+# to two days, and fetch widens the filter to compensate.
+set sincegot [nostr::dm::fetch -sec $BOB -relays [list $URL] \
+    -since [clock seconds]]
+check "fetch -since still finds the backdated wrap" [llength $sincegot] 1
 set m [lindex $got 0]
 check "dm sender is alice" [dict get $m from] $APUB
 set rumor [dict get $m rumor]
