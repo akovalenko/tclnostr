@@ -14,6 +14,14 @@ SRCS = tclnostr.c rand.c nip44.c chacha20.c hmac_sha256.c base64.c \
 OBJS = $(SRCS:%.c=build/s/%.o)
 POBJS = $(SRCS:%.c=build/p/%.o)
 
+# The vendored secp256k1 is compiled outside its build system, so its
+# shared headers declare statics that the precomputed-table TUs never
+# define or use; not ours to fix, silence just that class just there.
+SECPOBJS = build/s/secp256k1.o build/p/secp256k1.o \
+	build/s/precomputed_ecmult.o build/p/precomputed_ecmult.o \
+	build/s/precomputed_ecmult_gen.o build/p/precomputed_ecmult_gen.o
+$(SECPOBJS): CFLAGS += -Wno-unused-function
+
 all: libnostr.a $(SHARED)
 
 libnostr.a: $(OBJS)
