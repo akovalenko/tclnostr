@@ -1,6 +1,6 @@
 # tclnostr
 
-Nostr signer/verifier for Tcl 9: a C extension (package `nostr`) that
+Nostr signer/verifier for Tcl 8.6/9: a C extension (package `nostr`) that
 covers the frozen, fiddly parts of the protocol in C — canonical
 [NIP-01](https://github.com/nostr-protocol/nips/blob/master/01.md)
 event serialization, BIP-340 Schnorr signatures via
@@ -176,4 +176,8 @@ Everything else is public domain, see UNLICENSE.
 - One randomized `secp256k1_context` per interp; signing uses fresh
   `aux_rand` from the OS CSPRNG (getrandom / BCryptGenRandom /
   /dev/urandom), so signatures are not deterministic — ids are.
-- Tcl 9 only (stubs-enabled, `Tcl_Size`).
+- Tcl 8.6 or 9 (stubs-enabled; `Tcl_Size` is shimmed to `int` on 8.6).
+  One 8.6 caveat lives outside this package: the tcllib websocket
+  shipped for 8.6 (< 1.6) breaks on a second concurrent connection to
+  the same host:port in one process (the http keepalive pool tries to
+  reuse the upgraded socket). Distinct relays are unaffected.

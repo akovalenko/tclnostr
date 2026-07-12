@@ -1,4 +1,4 @@
-/* tclnostr — Nostr (NIP-01) signer/verifier for Tcl 9.
+/* tclnostr — Nostr (NIP-01) signer/verifier for Tcl 8.6 and 9.
  *
  * The package covers the frozen, fiddly parts in C: canonical NIP-01
  * event serialization (the byte format the event id is the sha256 of),
@@ -31,6 +31,10 @@
 #include "rand.h"
 #include "base64.h"
 #include "nip44.h"
+
+#if TCL_MAJOR_VERSION < 9
+typedef int Tcl_Size;		/* TIP 494 (Tcl 9); int-sized before */
+#endif
 
 #define NOSTR_VERSION "0.2"
 
@@ -2120,7 +2124,7 @@ Nostr_Init(Tcl_Interp *interp)
     NostrState *st;
     unsigned char seed[32];
 
-    if (Tcl_InitStubs(interp, "9.0", 0) == NULL) {
+    if (Tcl_InitStubs(interp, "8.6-", 0) == NULL) {
 	return TCL_ERROR;
     }
     st = (NostrState *)ckalloc(sizeof(NostrState));

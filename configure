@@ -19,9 +19,13 @@ for arg in "$@"; do
 done
 
 if [ -z "$TCLDIR" ]; then
-    guess=$(echo 'puts [::tcl::pkgconfig get libdir,install]' \
-	| tclsh9.0 2>/dev/null || true)
-    for d in "$guess" /usr/local/lib /usr/lib64 /usr/lib; do
+    for sh in tclsh9.0 tclsh8.6 tclsh; do
+	guess=$(echo 'puts [::tcl::pkgconfig get libdir,install]' \
+	    | $sh 2>/dev/null || true)
+	[ -n "$guess" ] && break
+    done
+    for d in "$guess" /usr/local/lib /usr/lib64 /usr/lib \
+	     /usr/lib/tcl9.0 /usr/lib/tcl8.6; do
 	if [ -n "$d" ] && [ -f "$d/tclConfig.sh" ]; then
 	    TCLDIR=$d
 	    break

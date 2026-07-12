@@ -97,7 +97,11 @@ if {[info exists env(AUTH_URL)]} {
 }
 
 # 6. watch: a persistent subscription delivers both the stored backlog
-#    and live post-EOSE events through -onevent, without closing.
+#    and live post-EOSE events through -onevent, and publishing over
+#    the same (watching) connection keeps working.  One connection on
+#    purpose: with the tcllib websocket shipped for 8.6 (< 1.6) a
+#    second concurrent connection to the same host:port collides with
+#    the http keepalive pool, which tries to reuse the upgraded socket.
 proc waitn {var n {ms 5000}} {
     upvar #0 $var v
     for {set i 0} {$i * 100 < $ms && [llength $v] < $n} {incr i} {
@@ -105,16 +109,17 @@ proc waitn {var n {ms 5000}} {
     }
     return [llength $v]
 }
-set pub [nostr::relay::connect $URL]
-lassign [nostr::relay::publish $pub \
+set w [nostr::relay::connect $URL]
+lassign [nostr::relay::publish $w \
     [nostr::sign -sec $BOB -kind 1 -content "watch: backlog"]] acc msg
 check "watch backlog note accepted" $acc 1
 set ::seen {}
-set w [nostr::relay::connect $URL]
 nostr::relay::watch $w w1 [dict create kinds [list 1] authors [list $BPUB]] \
     -onevent {lappend ::seen}
 check "watch delivers the stored backlog" [waitn ::seen 1] 1
-nostr::relay::publish $pub [nostr::sign -sec $BOB -kind 1 -content "watch: live"]
+lassign [nostr::relay::publish $w \
+    [nostr::sign -sec $BOB -kind 1 -content "watch: live"]] acc msg
+check "publish over a watching connection accepted" $acc 1
 check "watch delivers the live post-EOSE event" [waitn ::seen 2] 2
 check "live event content" \
     [regexp {"content":"watch: live"} [lindex $::seen 1]] 1
@@ -122,7 +127,6 @@ check "watched events verify" \
     [expr {[nostr::verify [lindex $::seen 0]]
 	   && [nostr::verify [lindex $::seen 1]]}] 1
 nostr::relay::close $w
-nostr::relay::close $pub
 
 # 7. watch through an auth relay: the REQ is retried automatically
 #    after the NIP-42 handshake, and the wrap published in 5 arrives.

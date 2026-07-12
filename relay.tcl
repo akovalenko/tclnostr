@@ -10,7 +10,7 @@
 #
 # This file is in the public domain (see UNLICENSE).
 
-package require Tcl 9
+package require Tcl 8.6-
 package require nostr
 package require websocket
 package require json
