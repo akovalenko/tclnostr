@@ -98,10 +98,7 @@ if {[info exists env(AUTH_URL)]} {
 
 # 6. watch: a persistent subscription delivers both the stored backlog
 #    and live post-EOSE events through -onevent, and publishing over
-#    the same (watching) connection keeps working.  One connection on
-#    purpose: with the tcllib websocket shipped for 8.6 (< 1.6) a
-#    second concurrent connection to the same host:port collides with
-#    the http keepalive pool, which tries to reuse the upgraded socket.
+#    the same (watching) connection keeps working.
 proc waitn {var n {ms 5000}} {
     upvar #0 $var v
     for {set i 0} {$i * 100 < $ms && [llength $v] < $n} {incr i} {
@@ -126,6 +123,17 @@ check "live event content" \
 check "watched events verify" \
     [expr {[nostr::verify [lindex $::seen 0]]
 	   && [nostr::verify [lindex $::seen 1]]}] 1
+
+# ... and a second concurrent connection to the same relay works: the
+# upgraded socket is evicted from the http keepalive pool (connect
+# repeats the websocket package's eviction against the socketMapping
+# pool of http 2.9.0..2.9.7, where the package's own one misses).
+set pub [nostr::relay::connect $URL]
+lassign [nostr::relay::publish $pub \
+    [nostr::sign -sec $BOB -kind 1 -content "watch: second conn"]] acc msg
+check "publish from a concurrent second connection accepted" $acc 1
+check "watch delivers the second connection's event" [waitn ::seen 3] 3
+nostr::relay::close $pub
 nostr::relay::close $w
 
 # 7. watch through an auth relay: the REQ is retried automatically

@@ -177,7 +177,9 @@ Everything else is public domain, see UNLICENSE.
   `aux_rand` from the OS CSPRNG (getrandom / BCryptGenRandom /
   /dev/urandom), so signatures are not deterministic — ids are.
 - Tcl 8.6 or 9 (stubs-enabled; `Tcl_Size` is shimmed to `int` on 8.6).
-  One 8.6 caveat lives outside this package: the tcllib websocket
-  shipped for 8.6 (< 1.6) breaks on a second concurrent connection to
-  the same host:port in one process (the http keepalive pool tries to
-  reuse the upgraded socket). Distinct relays are unaffected.
+  On 8.6 the websocket package's eviction of the upgraded socket from
+  the http keepalive pool misses -- http 2.9.0..2.9.7 renamed the pool
+  to `socketMapping` -- so a second connection to the same host:port
+  would reuse the websocket channel; `nostr::relay::connect` repeats
+  the eviction against the renamed pool, and concurrent connections to
+  the same relay work there too.

@@ -81,7 +81,30 @@ proc nostr::relay::connect {url args} {
 	return -code error \
 	    "connect to $url failed: [expr {$err eq {} ? $st : $err}]"
     }
+    EvictFromHttpPool $C(sock)
     return $tok
+}
+
+# After the upgrade the websocket package evicts its socket from the
+# http keepalive pool -- but it targets ::http::socketmap, and http
+# 2.9.0..2.9.7 (stock on Tcl 8.6) had renamed the pool to
+# socketMapping, so the eviction misses there and a later request to
+# the same host:port would try to reuse the websocket channel and
+# misread frames as an HTTP response.  Repeat the eviction against the
+# renamed pool; http::Unset forgets the whole per-connection family.
+# On http >= 2.9.8 upgrade sockets never enter the pool and this is a
+# no-op.
+proc nostr::relay::EvictFromHttpPool {sock} {
+    if {![info exists ::http::socketMapping]} return
+    foreach k [array names ::http::socketMapping] {
+	if {$::http::socketMapping($k) eq $sock} {
+	    if {[llength [info commands ::http::Unset]]} {
+		catch {::http::Unset $k}
+	    } else {
+		unset -nocomplain ::http::socketMapping($k)
+	    }
+	}
+    }
 }
 
 # Block in the event loop until CONDBODY (evaluated in the caller's
