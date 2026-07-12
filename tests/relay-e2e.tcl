@@ -96,6 +96,45 @@ if {[info exists env(AUTH_URL)]} {
     }
 }
 
+# 6. watch: a persistent subscription delivers both the stored backlog
+#    and live post-EOSE events through -onevent, without closing.
+proc waitn {var n {ms 5000}} {
+    upvar #0 $var v
+    for {set i 0} {$i * 100 < $ms && [llength $v] < $n} {incr i} {
+	after 100 {set ::tick 1}; vwait ::tick
+    }
+    return [llength $v]
+}
+set pub [nostr::relay::connect $URL]
+lassign [nostr::relay::publish $pub \
+    [nostr::sign -sec $BOB -kind 1 -content "watch: backlog"]] acc msg
+check "watch backlog note accepted" $acc 1
+set ::seen {}
+set w [nostr::relay::connect $URL]
+nostr::relay::watch $w w1 [dict create kinds [list 1] authors [list $BPUB]] \
+    -onevent {lappend ::seen}
+check "watch delivers the stored backlog" [waitn ::seen 1] 1
+nostr::relay::publish $pub [nostr::sign -sec $BOB -kind 1 -content "watch: live"]
+check "watch delivers the live post-EOSE event" [waitn ::seen 2] 2
+check "live event content" \
+    [regexp {"content":"watch: live"} [lindex $::seen 1]] 1
+check "watched events verify" \
+    [expr {[nostr::verify [lindex $::seen 0]]
+	   && [nostr::verify [lindex $::seen 1]]}] 1
+nostr::relay::close $w
+nostr::relay::close $pub
+
+# 7. watch through an auth relay: the REQ is retried automatically
+#    after the NIP-42 handshake, and the wrap published in 5 arrives.
+if {[info exists env(AUTH_URL)]} {
+    set ::aseen {}
+    set aw [nostr::relay::connect $env(AUTH_URL) -sec $BOB]
+    nostr::relay::watch $aw w2 [dict create kinds [list 1059] #p [list $BPUB]] \
+	-onevent {lappend ::aseen}
+    check "auth-relay watch sees the stored wrap" [waitn ::aseen 1 10000] 1
+    nostr::relay::close $aw
+}
+
 puts ""
 if {$fails == 0} {
     puts "relay e2e: ALL PASS"

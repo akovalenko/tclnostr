@@ -18,7 +18,7 @@ package require json
 namespace eval nostr::relay {
     variable conn;			# token -> state array, flattened
     variable counter 0
-    namespace export connect publish subscribe collect close
+    namespace export connect publish subscribe collect watch close
 }
 
 # Register an https factory so wss:// works: tls over a plain (or, with
@@ -113,13 +113,24 @@ proc nostr::relay::Handler {tok sock type msg} {
 	}
 	close - disconnect - timeout {
 	    set C(state) closed
+	    FireOnClose $tok
 	}
 	error {
 	    set C(error) $msg
 	    set C(state) closed
+	    FireOnClose $tok
 	}
     }
     if {[info exists C(wake)]} { incr C(wake) }
+}
+
+# Report a lost connection to a watch's -onclose at most once.
+proc nostr::relay::FireOnClose {tok} {
+    upvar #0 $tok C
+    if {[info exists C(onclose)]} {
+	after 0 [linsert $C(onclose) end $tok]
+	unset C(onclose)
+    }
 }
 
 # Route one relay frame into the connection's per-kind state slots.
@@ -129,7 +140,11 @@ proc nostr::relay::Dispatch {tok frameJson} {
     set verb [lindex $frame 0]
     switch -- $verb {
 	EVENT {
-	    lappend C(events) [lindex $frame 2]
+	    if {[info exists C(onevent)]} {
+		after 0 [linsert $C(onevent) end [lindex $frame 2]]
+	    } else {
+		lappend C(events) [lindex $frame 2]
+	    }
 	    incr C(evseq)
 	}
 	EOSE {
@@ -143,6 +158,9 @@ proc nostr::relay::Dispatch {tok frameJson} {
 	CLOSED {
 	    set C(closed-sub) [list [lindex $frame 1] [lindex $frame 2]]
 	    set C(eose) 1
+	    if {[info exists C(onevent)]} {
+		WatchClosed $tok [lindex $frame 2]
+	    }
 	}
 	AUTH {
 	    set C(auth) [lindex $frame 1]
@@ -285,8 +303,60 @@ proc nostr::relay::collect {tok args} {
     return $C(events)
 }
 
+# watch TOKEN subid filter -onevent CB ?-onclose CB?
+#   Persistent subscription: sends REQ and returns at once; the REQ is
+#   never CLOSEd by this side, and every event -- stored backlog and
+#   live post-EOSE arrivals alike -- is handed to CB from the event
+#   loop as `{*}CB eventJson`.  -onclose fires at most once, as
+#   `{*}CB token`, when the connection is lost or the relay kills the
+#   subscription; an auth-required CLOSED is retried behind the scenes
+#   first (NIP-42, needs connect -sec), mirroring collect.  The caller
+#   keeps the event loop running and calls close when done (a
+#   deliberate close does not fire -onclose); collect does not mix
+#   with a watching connection.
+proc nostr::relay::watch {tok subid filter args} {
+    upvar #0 $tok C
+    foreach {k v} $args {
+	switch -- $k {
+	    -onevent { set C(onevent) $v }
+	    -onclose { set C(onclose) $v }
+	    default  { return -code error "unknown option $k" }
+	}
+    }
+    if {![info exists C(onevent)]} {
+	return -code error "watch needs -onevent"
+    }
+    subscribe $tok $subid $filter
+}
+
+# The relay CLOSED a watched subscription.  auth-required gets one
+# retry once the automatic AUTH reply has gone out; anything else
+# means the watch is dead, reported like a lost connection.
+proc nostr::relay::WatchClosed {tok msg} {
+    upvar #0 $tok C
+    if {$C(sec) ne "" && ![info exists C(authretried)]
+	    && [string match -nocase "auth-required*" $msg]} {
+	set C(authretried) 1
+	ReSubscribe $tok 50
+	return
+    }
+    FireOnClose $tok
+}
+proc nostr::relay::ReSubscribe {tok tries} {
+    upvar #0 $tok C
+    if {![info exists C(state)] || $C(state) ne "open"} return
+    if {[info exists C(authsent)]} {
+	subscribe $tok $C(sub) $C(filter)
+    } elseif {$tries > 0} {
+	after 100 [list ::nostr::relay::ReSubscribe $tok [expr {$tries - 1}]]
+    } else {
+	FireOnClose $tok
+    }
+}
+
 proc nostr::relay::close {tok} {
     upvar #0 $tok C
+    catch {unset C(onclose)}
     catch {::websocket::close $C(sock)}
     catch {unset C}
 }
