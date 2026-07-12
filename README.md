@@ -80,6 +80,37 @@ bytes to feed straight into `nostr::verify` or `nostr::unwrap`. The
 outbound direction is trivial script-side: a signed event is already
 canonical JSON, so an `EVENT`/`REQ` envelope is plain string assembly.
 
+### Relay client and direct messages (script layer)
+
+`relay.tcl` is an optional pure-Tcl layer over the C package: a small
+relay client on tcllib `websocket` plus a NIP-17 direct-message API. It
+needs `websocket` and `json` from tcllib (and `tls` only for `wss://`).
+
+```tcl
+package require nostr::relay        ;# sources the C package too
+
+# for wss:// register a TLS socket factory once (ws:// needs nothing):
+nostr::relay::tls                   ;# or: nostr::relay::tls -socketcmd $proxy
+
+set c [nostr::relay::connect wss://relay.example -sec $key]
+nostr::relay::publish  $c $event                 ;# -> {accepted message}
+nostr::relay::subscribe $c sub {kinds {1} limit 20}
+set events [nostr::relay::collect $c]            ;# raw event JSON, to EOSE
+nostr::relay::close $c
+
+# NIP-17 private messages, gift-wrapped end to end:
+nostr::dm::send  -sec $key -to $peer -relays {wss://a wss://b} "hi"
+nostr::dm::fetch -sec $key -relays {wss://a} -since $t   ;# -> {from … rumor …}
+```
+
+`connect -sec` arms automatic NIP-42 AUTH: an `auth-required` rejection
+is answered with a signed kind-22242 and the operation retried. `send`
+also publishes a wrap addressed to the sender (a self-copy) so the
+sender's own client can read the thread; `fetch` subscribes for
+kind-1059 wraps p-tagged to the caller, unwraps each, and drops any
+that are not for the caller. The layer is exercised end to end against
+a loopback relay by `tests/run-relay-e2e.sh` (needs `nak serve`).
+
 Keys are accepted as `nsec1...`/`npub1...` or 64 hex digits. Defaults
 mirror nak: kind 1, empty content, empty tags, `created_at` = now.
 `-json` input is strict: unknown or duplicate event fields, floats,
