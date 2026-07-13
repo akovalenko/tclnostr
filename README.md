@@ -18,6 +18,11 @@ HTTP auth events from Tcl without shelling out to external tools; with
 the NIP-44/59 layer the same package also sends and receives encrypted
 direct messages over a WebSocket relay connection driven from script.
 
+The C core stands on [nostril](https://github.com/jb55/nostril) by
+jb55: the NIP-44 and gift-wrap code descends from that small, careful
+codebase, with its one libsodium dependency swapped for tiny RFC-based
+vendored primitives so the extension carries everything it needs.
+
 ## API
 
 ```tcl
